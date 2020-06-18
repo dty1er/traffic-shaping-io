@@ -1,64 +1,77 @@
 package tokenbucket
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
 
+type Store interface {
+	GetState(ctx context.Context) (*State, error)
+	SetState(ctx context.Context, state *State) error
+}
+
 type Bucket struct {
-	// rate is a rate that tokens are filled in the bucket.
+	// rps is a rate that tokens are filled in the bucket.
 	// A token is refilled every 1/rate second.
 	// Bigger rate, faster tokens refillment.
-	rate int64
+	rps int64
 
-	// capacity is a capacity of this bucket.
-	// It is the same as upper boundary of number of tokens in the bucket
+	// capacity
 	capacity int64
 
-	// tokens represents tokens in this bucket
-	tokens chan struct{}
-
-	done chan struct{}
+	store Store
 }
 
-func New(rate, capacity int64) *Bucket {
-	b := &Bucket{rate: rate, capacity: capacity, tokens: make(chan struct{}, capacity)}
-	go b.startRefill()
-
-	return b
+type State struct {
+	Last            int64 // unix timestamp (nanosec)
+	AvailableTokens int64 // number of available tokens
 }
 
-func (b *Bucket) startRefill() {
-	for {
-		select {
-		case <-b.done:
-			return
+func (s *State) IsZero() bool {
+	return s.Last == 0
+}
 
-		default:
-			if len(b.tokens) >= int(b.capacity) {
-				break // break select, goes to sleep
-			}
+func New(rps, capacity int64, store Store) *Bucket {
+	return &Bucket{rps: rps, capacity: capacity, store: store}
+}
 
-			b.tokens <- struct{}{}
-		}
+func (b *Bucket) Take(ctx context.Context, n int) (time.Duration, error) {
+	now := time.Now().Unix() / int64(time.Millisecond)
 
-		time.Sleep(time.Second / time.Duration(b.rate))
+	prev, err := b.store.GetState(ctx)
+	if err != nil {
+		return 0, err
 	}
-}
 
-func (b *Bucket) Stop() {
-	close(b.done)
-	close(b.tokens)
-}
+	newState := &State{Last: now}
 
-func (b *Bucket) Take(n int) {
-	for i := 0; i < n; i++ {
-		<-b.tokens
+	if prev.IsZero() {
+		// comes here only on first call
+		prev.Last = newState.Last
+		prev.AvailableTokens = b.capacity
 	}
+
+	sub := now - prev.Last                // milliseconds
+	refill := sub / (time.Second / b.rps) // how many token should be refilled
+	prev.AvailableTokens += refill
+	if prev.AvailableTokens > b.capacity {
+		prev.AvailableTokens = b.capacity
+	}
+
+	prev.AvailableTokens -= n
+	if prev.AvailableTokens < 0 {
+		// todo: sleep
+		prev.AvailableTokens = 0
+	}
+
+	newState.AvailableTokens = prev.AvailableTokens
+	// need to lock
+	b.store.SetState(ctx, newState)
 }
 
-func (b *Bucket) TakeOne() {
-	<-b.tokens
+func (b *Bucket) TakeOne(ctx context.Context) (time.Duration, error) {
+	return b.Take(ctx, 1)
 }
 
 func (b *Bucket) Debug() {
